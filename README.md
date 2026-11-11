@@ -1,11 +1,8 @@
-# 水质实验室检测结果归属核对 API
+# 实验室结果可靠投递服务（含本地模拟 LIMS）
 
-用 FastAPI 接收检测任务 CSV 与仪器离线结果 CSV，求“先最多配对、再最小计划时间偏差总和”的全部最优方案，并返回：
-
-- `definite_pairs`：所有最优方案**共有**的确定配对，可安全导入实验室系统；
-- `ambiguous_tasks` / `ambiguous_results`：其余记录在某个最优方案中可能对应的候选，以及该记录是否可能在某个最优方案中未配对。
-
-服务不在有歧义时擅自挑选一个“看起来最像”的配对，从而避免误归属。
+把已确认归属的检测结果写回 LIMS 时，保证**断线重试不重复入库、旧回执不覆盖更正、
+超时或进程退出后可沿用同一投递 ID 与快照继续投递**。投递端与模拟 LIMS 均为
+FastAPI + SQLite，整个环境可用 Docker Compose 一键启动。
 
 ## 快速启动
 
@@ -13,265 +10,205 @@
 docker compose up --build
 ```
 
-启动后：
+启动后四个容器：
 
-| 地址 | 用途 |
+| 服务 | 容器 | 地址 | 职责 |
+| --- | --- | --- | --- |
+| 投递 API | `api` | <http://localhost:8000> | 接收提交/更正、查询、手动重试（`/docs` 含可调用示例） |
+| 投递 worker | `worker1`、`worker2` | 无端口 | 两个独立工作进程，并发轮询共享 SQLite，租约互斥 |
+| 模拟 LIMS | `lims` | <http://localhost:8001> | 幂等入库、故障注入、远端查询入口 |
+
+端口占用时：`APP_PORT=8080 LIMS_PORT=8081 docker compose up --build`。
+
+| 入口 | 用途 |
 | --- | --- |
-| <http://localhost:8000/docs> | Swagger UI，可直接上传两份 CSV 试运行 |
-| <http://localhost:8000/redoc> | ReDoc |
-| <http://localhost:8000/openapi.json> | OpenAPI 文档 |
-| <http://localhost:8000/demo/tasks.csv> | 含歧义的演示任务 CSV |
-| <http://localhost:8000/demo/results.csv> | 含歧义的演示结果 CSV |
-| <http://localhost:8000/health> | 容器健康检查 |
+| <http://localhost:8000/docs> | 投递服务 Swagger UI（更正与重试示例可直接 Try it out） |
+| <http://localhost:8000/> | 平台首页与 curl 速览 |
+| <http://localhost:8001/docs> | 模拟 LIMS Swagger UI（含故障注入与查询入口） |
+| <http://localhost:8001/lims/results> | 模拟 LIMS 全部入库记录 |
+| <http://localhost:8001/lims/tasks/{task_id}> | 单任务当前值与修订链 |
+| <http://localhost:8001/lims/events> | 入库/幂等重放/拒绝事件流（核对无重复入库） |
+| <http://localhost:8000/reconciliation/docs> | 原“归属核对”服务（保留在子应用） |
 
-如 8000 端口被占用：`APP_PORT=8080 docker compose up --build`。停止服务用 `docker compose down`。
-
-也可以直接用 curl：
+一键演示脚本（提交、更正、断连重试、冲突、事件流核对）：
 
 ```bash
-curl -X POST http://localhost:8000/v1/reconciliations \
-  -F "tasks=@demo/tasks.csv;type=text/csv" \
-  -F "results=@demo/results.csv;type=text/csv"
+./demo/walkthrough.sh
 ```
 
-在 Swagger UI 中打开 `POST /v1/reconciliations`，点击 **Try it out**，两个文件字段分别选择上面下载的演示 CSV，再点击 **Execute**。
+## 可靠性模型
 
-## 接口
+### 1. 修订号与完整快照
 
-### `POST /v1/reconciliations`
+`POST /v1/tasks/{task_id}/results` 按任务 ID 接收 `result_id`、`sample_code`、
+`item`、`value`。每次调用都：
 
-`multipart/form-data`，两个文件字段均为必填：
+- 在 SQLite 保存该次提交的**完整快照**（不可变 JSON）；
+- 在任务内分配从 1 开始的**递增修订号**（事务内 `MAX(revision)+1`，并发提交不重号）；
+- 生成终身不变的**投递 ID** `dlv-...`；
+- 初始状态为 `pending`，即使旧修订仍在投递途中，更正也立即入库、互不阻塞。
 
-| 字段 | 内容 |
+### 2. 投递 ID 幂等：断线重试不重复入库
+
+worker 投递的请求体始终携带该修订固定的 `delivery_id`。模拟 LIMS：
+
+- 同 `delivery_id` + 同内容 → 不新增数据，重放首次回执（`replayed=true`）；
+- 同 `delivery_id` + 异内容 → `409 idempotency_conflict`，投递端置 `failed` 并保留数据。
+
+因此超时、连接重置（含“入库后断开回执”）、worker 崩溃后的重试，在 LIMS 侧都只会
+命中幂等重放，**不会产生第二条入库记录**。
+
+### 3. 旧回执不能把新修订标为已同步
+
+只有回执中的 `delivery_id` 与本地修订**完全相等**时才确认同步
+（`pending/delivering → synchronized`）。投递途中提交的更正是新修订、新投递 ID，
+旧修订迟到的成功回执命中不到新修订，无法影响其同步状态。
+
+### 4. 失败保留数据，可重新触发
+
+| 失败类型 | 处理 |
 | --- | --- |
-| `tasks` | 检测任务 CSV，最多 30 行数据（不含表头） |
-| `results` | 仪器离线结果 CSV，最多 30 行数据（不含表头） |
+| 超时、连接错误、5xx | 回到 `pending`，保留快照与投递 ID，worker 自动退避重试 |
+| 409（同 ID 异内容、修订冲突） | 置 `failed`，数据完整保留，等待人工处理或 `POST .../retry` |
+| 已同步 | 不允许重试（`409 already_synchronized`） |
 
-成功时返回 `200` 和如下结构：
+`POST /v1/tasks/{task_id}/revisions/{revision}/retry` 清除租约与错误、回到
+`pending`，**沿用原投递 ID 与快照**。
 
-```json
-{
-  "summary": {
-    "task_records": 6,
-    "result_records": 7,
-    "eligible_candidate_pairs": 7,
-    "max_pairs": 4,
-    "minimum_total_absolute_deviation_seconds": 2700,
-    "definite_pair_count": 2,
-    "ambiguous_task_count": 4,
-    "ambiguous_result_count": 5
-  },
-  "definite_pairs": [
-    {
-      "task_id": "T-004",
-      "result_id": "R-004",
-      "sample_code": "S-300",
-      "item": "Pb",
-      "planned_time": "2026-11-11T14:00:00Z",
-      "allowed_start": "2026-11-11T13:00:00Z",
-      "allowed_end": "2026-11-11T15:00:00Z",
-      "test_time": "2026-11-11T14:10:00Z",
-      "value": "0.012",
-      "deviation_seconds": 600
-    }
-  ],
-  "ambiguous_tasks": [
-    {
-      "task_id": "T-001",
-      "sample_code": "S-100",
-      "item": "pH",
-      "planned_time": "2026-11-11T10:00:00Z",
-      "allowed_start": "2026-11-11T09:00:00Z",
-      "allowed_end": "2026-11-11T11:00:00Z",
-      "possible_result_pairs": [
-        {
-          "result_id": "R-001",
-          "test_time": "2026-11-11T09:30:00Z",
-          "value": "7.10",
-          "deviation_seconds": 1800
-        },
-        {
-          "result_id": "R-002",
-          "test_time": "2026-11-11T10:30:00Z",
-          "value": "7.20",
-          "deviation_seconds": 1800
-        }
-      ],
-      "possibly_unpaired": false
-    }
-  ],
-  "ambiguous_results": [
-    {
-      "result_id": "R-005",
-      "sample_code": "S-300",
-      "item": "Pb",
-      "test_time": "2026-11-11T14:30:00Z",
-      "value": "0.011",
-      "possible_task_pairs": [],
-      "possibly_unpaired": true
-    }
-  ]
-}
-```
+### 5. 重启继续与多 worker 并发
 
-（示例只截取了部分数组元素；实际响应会逐条列出所有未确定记录。）
+- worker 通过 SQLite 条件 UPDATE 实现行级**租约**（`lease_owner` +
+  `lease_expires_at`）：同一修订任一时刻只被一个 worker 认领并发出 HTTP 请求；
+- worker 被 kill / 崩溃后租约到期，其他 worker 接管，attempts 累加但投递 ID 不变；
+- 投递期间有心跳续租，防止长请求被误接管；
+- compose 中 `worker1`、`worker2` 共享同一个 SQLite 卷（WAL 模式）。
+  本地不用 Docker 直接 `uvicorn app.main:app` 时，API 进程内置一个 worker，开箱即用。
 
-#### 响应语义
+### 6. 模拟 LIMS 的远端修订规则
 
-- `definite_pairs`：在所有最优方案中都出现的边。每条任务和结果最多出现一次。**只有这些可以自动导入。**
-- `ambiguous_tasks[*].possible_result_pairs`：该任务在至少一个最优方案中可能配对的结果全集。
-- `ambiguous_results[*].possible_task_pairs`：该结果在至少一个最优方案中可能配对的任务全集。
-- `possibly_unpaired = true`：存在至少一个最优方案令该记录不配对。即使候选列表只有一条，也不能据此自动归属。
-- `possible_*_pairs = []` 且 `possibly_unpaired = true`：该记录在所有最优方案中都只能不配对。
-- 已进入 `definite_pairs` 的任务/结果不会再出现在歧义数组中。
+- 每个 `task_id` 只保留**最高修订**：低修订迟到 → `409 stale_revision`，远端不倒退；
+- 同修订号不同投递 ID → `409 revision_taken`；
+- 故障注入（请求体 `simulate` 或请求头 `X-Simulate-Mode`）：
+  - `disconnect_after_store`：事务提交后中断响应流，模拟入库后回执丢失；
+  - `delay`（配合 `simulate_delay_seconds`）：延迟回执；
+  - `error_500`：服务端故障（不入库）。
 
-### 错误
+## 接口一览（投递服务，前缀 `/v1`）
 
-CSV 格式、表头、字段值、行数或时间格式不合规时返回 `422`：
-
-```json
-{
-  "detail": {
-    "code": "csv_validation_error",
-    "message": "tasks CSV 表头不完整。",
-    "errors": [
-      {
-        "file": "tasks",
-        "row": 1,
-        "field": "allowed_start/allowed_end",
-        "message": "缺少允许检测时段：请提供 allowed_start 与 allowed_end 两列，或 allowed_interval 一列。"
-      }
-    ]
-  }
-}
-```
-
-`row` 是 CSV 物理行号，表头为第 1 行。两个文件都会校验，便于一次修正全部问题。
-
-## CSV 格式
-
-UTF-8（可带 BOM），逗号分隔；也兼容分号、制表符分隔。空白数据行会被跳过。
-
-### 检测任务 `tasks`
-
-| 列名 | 必填 | 说明 |
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `task_id` | 是 | 任务唯一编号，文件内不可重复 |
-| `sample_code` | 是 | 样品码 |
-| `item` | 是 | 检测项目 |
-| `planned_time` | 是 | 计划检测时间 |
-| `allowed_start` | 是* | 允许检测时段开始（含） |
-| `allowed_end` | 是* | 允许检测时段结束（含） |
-| `allowed_interval` | 是* | 可用 `START/END` 代替上面两列，如 `2026-11-11T09:00:00Z/2026-11-11T11:00:00Z` |
+| POST | `/v1/tasks/{task_id}/results` | 提交结果/更正，返回新修订与投递 ID |
+| POST | `/v1/tasks/{task_id}/revisions/{revision}/retry` | 重新触发（沿用投递 ID 与快照） |
+| GET | `/v1/tasks` | 所有任务当前（最高）修订与同步状态 |
+| GET | `/v1/tasks/{task_id}` | 当前结果、全部修订、同步状态 |
+| GET | `/v1/tasks/{task_id}/revisions/{revision}` | 单修订详情与事件轨迹 |
+| GET | `/health` | 健康检查 |
 
-\* `allowed_start` + `allowed_end` 必须同时提供，**或**提供 `allowed_interval`。若同时提供，优先使用分列；分列缺失时尝试 `allowed_interval`。
+状态取值：`pending`（待投递）、`delivering`（租约投递中）、
+`synchronized`（已收到匹配回执）、`failed`（明确拒绝，保留数据）。
 
-任务示例：
+### curl 示例
 
-```csv
-task_id,sample_code,item,planned_time,allowed_start,allowed_end
-T-001,S-100,pH,2026-11-11T10:00:00Z,2026-11-11T09:00:00Z,2026-11-11T11:00:00Z
+```bash
+# 提交
+curl -s -X POST http://localhost:8000/v1/tasks/T-001/results \
+  -H 'Content-Type: application/json' \
+  -d '{"result_id":"R-001","sample_code":"S-100","item":"pH","value":"7.10"}'
+
+# 查询（观察 pending → delivering → synchronized）
+curl -s http://localhost:8000/v1/tasks/T-001
+
+# 更正（生成 revision=2）
+curl -s -X POST http://localhost:8000/v1/tasks/T-001/results \
+  -H 'Content-Type: application/json' \
+  -d '{"result_id":"R-001","sample_code":"S-100","item":"pH","value":"7.15"}'
+
+# 模拟 LIMS 侧查询
+curl -s http://localhost:8001/lims/tasks/T-001
 ```
 
-### 仪器离线结果 `results`
+## 数据存储
 
-| 列名 | 必填 | 说明 |
-| --- | --- | --- |
-| `result_id` | 是 | 结果唯一编号，文件内不可重复 |
-| `sample_code` | 是 | 样品码，必须与任务完全一致才可能配对 |
-| `item` | 是 | 检测项目，必须与任务完全一致才可能配对 |
-| `test_time` | 是 | 实际检测时间 |
-| `value` | 是 | 数值，必须为有限数；响应中保留原始文本 |
+两个独立 SQLite 文件，分别挂载在独立 Docker 卷：
 
-结果示例：
+- 投递端 `delivery.db`（卷 `delivery-data`）：
+  - `result_revisions`：修订、快照 JSON、投递 ID、状态、租约、尝试次数、错误、回执修订；
+  - `delivery_events`：`submitted / delivery_attempt / delivery_failed /
+    synchronized / retriggered` 只增事件轨迹。
+- 模拟 LIMS `lims.db`（卷 `lims-data`）：
+  - `lims_results`：`delivery_id` 唯一、`(task_id, revision)` 唯一；
+  - `lims_events`：`stored / idempotent_replay / rejected`。
 
-```csv
-result_id,sample_code,item,test_time,value
-R-001,S-100,pH,2026-11-11T09:30:00Z,7.10
-```
-
-### 时间与文本规则
-
-- 时间必须显式标注 UTC：推荐 `YYYY-MM-DDTHH:MM:SSZ`，也接受 `+00:00`。
-- 必须是整秒；拒绝小数秒和非 UTC 偏移（如 `+08:00`）。
-- 响应中的时间统一规范化为 `YYYY-MM-DDTHH:MM:SSZ`。
-- 样品码与检测项目区分大小写，按去除首尾空白后的完整字符串精确比较。
-- 以下表头别名也可使用（大小写不敏感）：
-  - 任务：`编号/唯一编号/任务编号`、`样品码/样品编号`、`检测项目/项目`、`计划时间`、`允许检测时段`等；
-  - 结果：`结果编号/唯一编号`、`样品码/样品编号`、`检测项目/项目`、`检测时间`、`数值/结果值`等。
-  推荐仍使用上面的规范英文列名。
-
-## 优化与判定算法
-
-1. 候选边：样品码、项目精确相同，且 `allowed_start <= test_time <= allowed_end`（闭区间）。
-2. 建立源点 → 任务 → 结果 → 汇点的单位容量网络；任务-结果边费用为
-   `|test_time - planned_time|` 秒。
-3. 先求最大流（最大配对数），再在最大流下求最小费用（最小偏差总和）。
-4. 在求得的最优流上计算残量网络和合法节点势能，只保留**缩减费用为 0** 的残量弧。任意另一个同值同费用的最优解，都对应这些零费用弧构成的环流。
-5. 对零费用残量图求强连通分量（SCC）：
-   - 未使用的任务-结果边若在某个零费用环中（两端同 SCC），则它出现在某个最优解中；
-   - 已使用边的反向弧若在零费用环中，则该边可被其他最优解替换，不属于确定配对；
-   - 任务/结果与源点/汇点的反向弧是否在零费用环中，决定它是否可能未配对。
-6. 确定配对 = 当前最优解中使用、且反向弧不在任何零费用环中的边。确定配对集合不依赖每一条最优解的枚举，因此即使最优解数量很大也能快速给出精确交集和候选并集。
-
-规模上限为每侧 30 条，候选边最多 900 条；算法运行时间与网络规模多项式相关，不随最优解数量指数增长。
-
-## 演示数据说明
-
-`demo/tasks.csv` 与 `demo/results.csv` 有意覆盖：
-
-| 情形 | 记录 | 预期 |
-| --- | --- | --- |
-| 对称二选一，偏差同为 1800 秒 | `T-001` / `R-001`、`R-002` | 无确定配对；任务总会被配对，两个结果均可能未配对 |
-| 两个任务竞争同一结果 | `T-002`、`T-003` / `R-003` | 无确定配对；结果总会被配对，两个任务均可能未配对 |
-| 偏差不同，唯一最优 | `T-004` / `R-004`（600 秒）与 `R-005`（1800 秒） | `T-004-R-004` 确定；`R-005` 必然未配对 |
-| 无竞争，唯一最优 | `T-005` / `R-006` | `T-005-R-006` 确定 |
-| 无候选 | `T-006`、`R-007` | 必然未配对 |
-
-该演示的最优目标为：`max_pairs = 4`，`minimum_total_absolute_deviation_seconds = 2700`，确定配对 2 条。
+清空演示数据：`POST http://localhost:8001/lims/admin/reset`；
+清空投递端历史：删除卷 `docker compose down -v` 后重启。
 
 ## 本地开发与测试
 
-需要 Python 3.11+：
+Python 3.11+：
 
 ```bash
-python3.11 -m venv .venv
-. .venv/bin/activate
 pip install -r requirements-dev.txt
-uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试包括：
+测试（45 个）覆盖：
 
-- CSV 别名、合并时段、BOM、分号分隔、严格 UTC 校验、30 行上限、重复编号与数值校验；
-- 随机小规模图与穷举所有匹配的交叉验证（确定配对、候选并集、可能未配对均逐项比对）；
-- 演示数据预期、API 成功/422 响应、OpenAPI 与演示文件可用性。
+- 修订号递增、快照不可变、并发提交不重号、租约互斥与过期接管；
+- 仅匹配投递 ID 的回执才能确认同步、可重试失败与硬失败、手动重试；
+- 模拟 LIMS 幂等重放、同 ID 异内容 409、过期修订/修订占用 409、延迟、500、断连；
+- API 提交/更正/查询/重试/404/409/事件轨迹；
+- 端到端（真实 worker 循环 + ASGI HTTP）：正常投递、投递途中更正、
+  断连后幂等重试、**两个 worker 并发洪泛无重复入库且远端不倒退**、worker 重启恢复。
+
+不用 Docker 的本地运行方式（三个进程）：
+
+```bash
+# 1) 模拟 LIMS
+LIMS_DB_PATH=./data/lims.db uvicorn app.lims.app:app --port 8001
+# 2) 投递 API（内置 worker；如需独立 worker 见下）
+DELIVERY_DB_PATH=./data/delivery.db LIMS_BASE_URL=http://127.0.0.1:8001 \
+  uvicorn app.main:app --port 8000
+# 3) 可选：独立 worker（可启动多个副本）
+DELIVERY_DB_PATH=./data/delivery.db LIMS_BASE_URL=http://127.0.0.1:8001 \
+  ENABLE_INPROCESS_WORKER=false python -m app.worker_main
+```
 
 ## 文件结构
 
 ```
 app/
-  main.py          FastAPI 路由、OpenAPI 描述、响应组装
-  csv_parser.py    严格 CSV 解析与中文/英文表头别名
-  domain.py        任务与结果领域对象、UTC 格式化
-  optimizer.py     最大流最小费用 + 零费用残量图 SCC 分类
-  schemas.py       Pydantic 响应/错误模型（OpenAPI 文档来源）
+  config.py              环境变量开关（进程内 worker 等）
+  main.py                根应用（投递服务）+ 挂载 /reconciliation 旧服务
+  main_legacy.py         原归属核对服务
+  worker_main.py         独立 worker 进程入口
+  delivery/
+    config.py            投递端可调参数（DB 路径、超时、租约、退避）
+    db.py                SQLite 修订/快照/租约/状态流转/事件
+    schemas.py           Pydantic 模型（/docs 示例来源）
+    lims_client.py       LIMS HTTP 客户端与回执判定
+    worker.py            异步 worker 循环、心跳、退避
+    api.py               投递 FastAPI 路由与生命周期
+  lims/
+    db.py                模拟 LIMS SQLite（唯一约束、事件）
+    schemas.py           LIMS 请求/回执/冲突模型
+    app.py               LIMS 路由、幂等规则、故障注入
 demo/
-  tasks.csv        歧义演示任务
-  results.csv      歧义演示结果
-tests/
-Dockerfile
-docker-compose.yml
-requirements.txt
+  walkthrough.sh         端到端演示脚本
+  tasks.csv / results.csv 原核对服务演示数据
+tests/                   单元与端到端测试
+docker-compose.yml       api + worker1 + worker2 + lims
+Dockerfile               统一镜像（通过 command 区分角色）
 ```
 
-## 容器运维
+## 环境变量
 
-```bash
-docker compose ps
-docker compose logs -f api
-docker compose down
-```
-
-Compose 使用非 root 用户运行容器，并配置了 `/health` 健康检查；服务重启策略为 `unless-stopped`。
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DELIVERY_DB_PATH` | `/data/delivery.db` | 投递端 SQLite 路径 |
+| `LIMS_DB_PATH` | `/data/lims.db` | 模拟 LIMS SQLite 路径 |
+| `LIMS_BASE_URL` | `http://lims:8001` | LIMS 地址 |
+| `LIMS_TIMEOUT_SECONDS` | `5` | 单次投递 HTTP 超时 |
+| `LEASE_SECONDS` | `30` | worker 租约时长 |
+| `POLL_INTERVAL_SECONDS` | `0.5` | worker 轮询间隔 |
+| `BACKOFF_BASE_SECONDS` / `BACKOFF_MAX_SECONDS` | `1` / `30` | 失败退避 |
+| `ENABLE_INPROCESS_WORKER` | `true` | API 进程内 worker（compose 中关闭，交给两个独立 worker） |

@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --chown=app:app app ./app
 COPY --chown=app:app demo ./demo
 
+# 持久化目录：投递端与 LIMS 各自的 SQLite 文件挂载到这里。
+RUN mkdir -p /data && chown app:app /data
+
 USER app
 
 EXPOSE 8000
@@ -22,4 +25,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
 
+# 默认启动投递 API；worker 与模拟 LIMS 在 compose 中覆盖 command。
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

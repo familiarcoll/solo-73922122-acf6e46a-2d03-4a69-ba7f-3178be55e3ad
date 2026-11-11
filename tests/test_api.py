@@ -1,10 +1,12 @@
+"""原归属核对服务的 API 测试（现挂载在 /reconciliation 子应用）。"""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main_legacy import app
 
 DEMO = Path(__file__).resolve().parent.parent / "demo"
 client = TestClient(app)
@@ -101,3 +103,11 @@ def test_docs_and_demo_files_are_available() -> None:
     assert client.get("/demo/results.csv").status_code == 200
     assert client.get("/health").json() == {"status": "ok"}
     assert client.get("/").status_code == 200
+
+
+def test_legacy_app_mounted_under_reconciliation() -> None:
+    from app.main import app as root_app
+
+    root_client = TestClient(root_app)
+    assert root_client.get("/reconciliation/health").status_code == 200
+    assert root_client.get("/reconciliation/docs").status_code == 200

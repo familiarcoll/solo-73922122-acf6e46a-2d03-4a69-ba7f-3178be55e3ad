@@ -6,4 +6,5 @@ __pycache__
 .venv
 tests
 requirements-dev.txt
+pytest.ini
 README.md

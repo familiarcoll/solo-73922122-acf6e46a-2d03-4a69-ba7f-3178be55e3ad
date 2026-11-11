@@ -1,15 +1,28 @@
 services:
+  # 投递 API：接收提交/查询/重试，并运行一个进程内 worker（本地开箱即用）。
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: lab-result-reconciliation:local
+    image: lab-result-delivery:local
     init: true
     restart: unless-stopped
     environment:
       TZ: UTC
+      DELIVERY_DB_PATH: /data/delivery.db
+      LIMS_BASE_URL: http://lims:8001
+      # 容器部署时投递由两个独立 worker 进程负责，API 不重复跑 worker；
+      # 本地直接 `uvicorn app.main:app` 运行时默认开启进程内 worker，开箱即用。
+      ENABLE_INPROCESS_WORKER: "false"
+      LEASE_SECONDS: "30"
+      LIMS_TIMEOUT_SECONDS: "5"
     ports:
       - "${APP_PORT:-8000}:8000"
+    volumes:
+      - delivery-data:/data
+    depends_on:
+      lims:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -20,3 +33,69 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  # 两个独立 worker 进程：与 API 共享同一个 SQLite 文件，
+  # 通过租约互斥，验证并发投递不重复入库、远端修订不倒退。
+  worker1:
+    image: lab-result-delivery:local
+    init: true
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker_main"]
+    environment:
+      TZ: UTC
+      DELIVERY_DB_PATH: /data/delivery.db
+      LIMS_BASE_URL: http://lims:8001
+      LEASE_SECONDS: "30"
+      LIMS_TIMEOUT_SECONDS: "5"
+      POLL_INTERVAL_SECONDS: "0.5"
+    volumes:
+      - delivery-data:/data
+    depends_on:
+      lims:
+        condition: service_healthy
+
+  worker2:
+    image: lab-result-delivery:local
+    init: true
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker_main"]
+    environment:
+      TZ: UTC
+      DELIVERY_DB_PATH: /data/delivery.db
+      LIMS_BASE_URL: http://lims:8001
+      LEASE_SECONDS: "30"
+      LIMS_TIMEOUT_SECONDS: "5"
+      POLL_INTERVAL_SECONDS: "0.5"
+    volumes:
+      - delivery-data:/data
+    depends_on:
+      lims:
+        condition: service_healthy
+
+  # 本地模拟 LIMS：独立进程、独立 SQLite 卷。
+  lims:
+    image: lab-result-delivery:local
+    init: true
+    restart: unless-stopped
+    command: ["uvicorn", "app.lims.app:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      TZ: UTC
+      LIMS_DB_PATH: /data/lims.db
+    ports:
+      - "${LIMS_PORT:-8001}:8001"
+    volumes:
+      - lims-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  delivery-data:
+  lims-data:
